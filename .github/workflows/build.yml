@@ -41,6 +41,14 @@ jobs:
           CURRENT_REPO="${GITHUB_REPOSITORY#*/}"
           
           # Initialize metadata tracking state file if missing
+          # Per-run result trackers, printed as a compact summary at the end
+          SUMMARY_DIR="$GITHUB_WORKSPACE/.scan-summary"
+          mkdir -p "$SUMMARY_DIR"
+          : > "$SUMMARY_DIR/unchanged.txt"
+          : > "$SUMMARY_DIR/built.txt"
+          : > "$SUMMARY_DIR/failed.txt"
+          : > "$SUMMARY_DIR/no-debian.txt"
+
           mkdir -p public
           if [ ! -f public/state.json ]; then
             echo "{}" > public/state.json
@@ -110,6 +118,7 @@ jobs:
 
             if [ -z "$LATEST_SHA" ]; then
               echo " -> [SKIP] Could not resolve any commit SHA for $REPO. Is the repository completely empty?"
+              echo "$REPO (no commit SHA / empty repo)" >> "$SUMMARY_DIR/failed.txt"
               continue
             fi
 
@@ -118,6 +127,7 @@ jobs:
 
             if [ "$LATEST_SHA" = "$LAST_SHA" ]; then
               echo " -> [OK] No new commits detected ($LATEST_SHA). Already up to date."
+              echo "$REPO" >> "$SUMMARY_DIR/unchanged.txt"
               continue
             fi
 
@@ -137,6 +147,7 @@ jobs:
 
             if [ -z "$HAS_DEBIAN" ]; then
               echo " -> [SKIP] No 'debian/control' file found anywhere in $REPO. Skipping compilation."
+              echo "$REPO" >> "$SUMMARY_DIR/no-debian.txt"
               # Store state so we don't spam the API on unchanged repos
               jq --arg repo "$REPO" --arg sha "$LATEST_SHA" '.[$repo] = {sha:$sha, date: "N/A", packages: "No debian/control"}' public/state.json > tmp.json && mv tmp.json public/state.json
               continue
@@ -167,7 +178,8 @@ jobs:
               --tool='apt-get -o Debug::pkgProblemResolver=yes --no-install-recommends --yes' \
               debian/control || echo "Dependency warnings encountered."
 
-            dpkg-buildpackage -us -uc -b || echo "Compilation failed for $REPO."
+            BUILD_OK=1
+            dpkg-buildpackage -us -uc -b || { echo "Compilation failed for $REPO."; BUILD_OK=0; }
             
             # Return to the central workspace root
             cd "${{ github.workspace }}"
@@ -177,8 +189,14 @@ jobs:
             
             if [ -z "$BUILT_PACKAGES" ]; then
               echo " -> [ERROR] Compilation finished but no .deb binary packages were captured."
+              if [ "$BUILD_OK" = "0" ]; then
+                echo "$REPO (build failed)" >> "$SUMMARY_DIR/failed.txt"
+              else
+                echo "$REPO (no .deb produced)" >> "$SUMMARY_DIR/failed.txt"
+              fi
             else
               echo " -> [SUCCESS] Packages produced: $BUILT_PACKAGES"
+              echo "$REPO -> $BUILT_PACKAGES" >> "$SUMMARY_DIR/built.txt"
               mv *.deb new-output/ 2>/dev/null || true
               mv *.changes new-output/ 2>/dev/null || true
               
@@ -194,6 +212,37 @@ jobs:
             fi
             rm -rf source-code
           done
+
+          # 4. END-OF-RUN SUMMARY (log + job summary page)
+          print_section() {
+            # $1 = title, $2 = file
+            local COUNT
+            COUNT=$(grep -c . "$2" || true)
+            echo ""
+            echo "$1 ($COUNT)"
+            if [ "$COUNT" -gt 0 ]; then sed 's/^/   - /' "$2"; else echo "   (none)"; fi
+          }
+
+          {
+            echo "=================================================="
+            echo "                  SCAN SUMMARY"
+            echo "=================================================="
+            print_section "[UP TO DATE] No new commits" "$SUMMARY_DIR/unchanged.txt"
+            print_section "[BUILT] Successfully built" "$SUMMARY_DIR/built.txt"
+            print_section "[FAILED] Build failed" "$SUMMARY_DIR/failed.txt"
+            print_section "[SKIPPED] No debian/control" "$SUMMARY_DIR/no-debian.txt"
+            echo "=================================================="
+          } | tee summary.txt
+
+          {
+            echo "## Scan Summary"
+            for SECTION in "unchanged:Up to date (no new commits)" "built:Successfully built" "failed:Failed" "no-debian:Skipped (no debian/control)"; do
+              F="${SECTION%%:*}"; T="${SECTION#*:}"
+              echo "### $T ($(grep -c . "$SUMMARY_DIR/$F.txt" || true))"
+              if [ -s "$SUMMARY_DIR/$F.txt" ]; then sed 's/^/- /' "$SUMMARY_DIR/$F.txt"; else echo "_none_"; fi
+              echo ""
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Import GPG key
         env:
